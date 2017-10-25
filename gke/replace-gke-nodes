@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Replaces one or more GKE nodes in the same node pool.
+# Run with -s to see the exact commands that would have been run when not in
+# simulation mode. Suitable of you don't trust this script to make
+# modifications to your cluster, but wants its help in navigating the maze of
+# references that google's APIs consist of.
+
+set -e
+
+x() {
+  echo "[*] $*"
+  [ -n "$DRYRUN" ] || "$@"
+}
+
+findClusterName() {
+  gcloud container clusters list --format "value(NAME)"
+}
+
+findNodePool() {
+  node=$1
+  kubectl get node "$node" -o json | jq -r '.metadata.labels["cloud.google.com/gke-nodepool"]'
+}
+
+findCurrentNodePoolSize() {
+  node_pool=$1
+  kubectl get nodes -l cloud.google.com/gke-nodepool=$node_pool --no-headers \
+      | wc -l | tr -d '[:space:]'
+}
+
+resizeCluster() {
+  cluster=$1; node_pool=$2; new_size=$3
+  x gcloud -q container clusters resize $cluster --node-pool=$node_pool --size=$new_size
+}
+
+findReadyNodeCount() {
+  node_pool=$1
+  kubectl get nodes -l cloud.google.com/gke-nodepool=$node_pool --no-headers | awk '$2=="Ready" {total+=1} END{print total}'
+}
+
+waitUntilNewNodesReady() {
+  node_pool=$1; expected_size=$2
+  [ -n "$DRYRUN" ] && expected_size=$(findReadyNodeCount $node_pool)
+  echo -n "[*] Waiting for new nodes to become ready"
+  while [ ! "$(findReadyNodeCount $node_pool)" = "$expected_size" ]; do
+    echo -n '.'
+    sleep 2
+  done
+  echo
+}
+
+drainNodes() {
+  for node in "$@"; do
+    x kubectl drain $node --delete-local-data --force --ignore-daemonsets \
+        --grace-period=$GRACE_PERIOD
+  done
+}
+
+findInstanceGroupName() {
+  gcloud container node-pools describe $node_pool --format json \
+      | jq -r '.instanceGroupUrls[0]' | awk -F/ '{print $NF}'
+}
+
+deleteNodes() {
+  node_pool=$1
+  nodes="${@:2}"
+  instance_group=$(findInstanceGroupName $node_pool)
+  for node in ${nodes[*]}; do
+    x gcloud -q compute instance-groups managed delete-instances $instance_group --instances=$node
+  done
+}
+
+
+usage() {
+  echo "Usage: $(basename $0) [-s] NODE_NAME [NODE_NAME...]"
+  echo "Replaces one or more nodes in a GKE nodepool"
+  echo
+  echo "Options: "
+  echo "  -s  Dry-run. Show mutation operations instead of executing them. For debugging."
+  exit 1
+}
+
+if [ "$1" = "-s" ]; then
+  echo "[*] Dry-run (simulation) mode"
+  DRYRUN=1
+  shift
+fi
+[ -n "$1" ] || usage
+
+NODES="$@"
+BAD_NODE_COUNT=${#NODES[*]}
+NODE_POOL=$(findNodePool ${NODES[0]})
+NODE_POOL_SIZE=$(findCurrentNodePoolSize $NODE_POOL)
+NEW_POOL_SIZE=$((NODE_POOL_SIZE + BAD_NODE_COUNT))
+CLUSTER_NAME=$(findClusterName)
+GRACE_PERIOD=10  # seconds
+
+resizeCluster $CLUSTER_NAME $NODE_POOL $NEW_POOL_SIZE
+waitUntilNewNodesReady $NODE_POOL $NEW_POOL_SIZE
+drainNodes ${NODES[*]}
+deleteNodes $NODE_POOL ${NODES[*]}
+
+echo "[*] Success!"
